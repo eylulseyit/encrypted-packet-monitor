@@ -1,147 +1,121 @@
-#include <Wire.h>
-#include <LiquidCrystal_I2C.h>
-#include <DHT.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <mbedtls/aes.h>
+#include "Base64.h"
+#include <time.h>
 
-//DHT11
-#define DHTPIN 13
-#define DHTTYPE DHT11
-DHT dht(DHTPIN, DHTTYPE);
 
-//HC-SR04
-#define TRIG_PIN 25
-#define ECHO_PIN 26
+const char* ssid = "WIFI_NAME";
+const char* password = "WIFI_PASSWORD";
+const char* serverUrl = "http://192.168.1.7:5000/webhook";
 
-//Buzzer
-#define BUZZER_PIN 27
+const uint8_t aesKey[16] = {
+  0x00, 0x01, 0x02, 0x03,
+  0x04, 0x05, 0x06, 0x07,
+  0x08, 0x09, 0x0A, 0x0B,
+  0x0C, 0x0D, 0x0E, 0x0F
+};
 
-//LCD
-LiquidCrystal_I2C lcd(0x27, 16, 2);
+void connectToWiFi() {
+  WiFi.begin(ssid, password);
+  Serial.print("WiFi connection loading..");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected");
 
-//Motors
-const int MOTOR1_IN1 = 2;   // D2
-const int MOTOR1_IN2 = 4;   // D4
-const int MOTOR2_IN1 = 18;  // D18
-const int MOTOR2_IN2 = 19;  // D19
+    configTime(3 * 3600, 0, "pool.ntp.org", "time.nist.gov"); // Türkiye saati için GMT+3
+  Serial.println("Waiting for NTP time sync...");
+  time_t now = time(nullptr);
+  while (now < 100000) {
+    delay(500);
+    Serial.print(".");
+    now = time(nullptr);
+  }
+  Serial.println("\nTime synchronized.");
 
-unsigned long lastDisplayUpdate = 0;
+}
+
+String generateSensorData() {
+  float temperature = random(200, 300) / 10.0;
+  int humidity = random(30, 60);
+  String sensorId = "esp32_1";
+
+  time_t now = time(nullptr);
+
+  String jsonData = "{\"temperature\":" + String(temperature, 1) +
+                    ",\"humidity\":" + String(humidity) +
+                    ",\"sensor_id\":\"" + sensorId + "\"" +
+                    ",\"timestamp\":" + String((unsigned long)now) + "}";
+  return jsonData;
+}
+
+String encryptAES128(String plainText) {
+  mbedtls_aes_context aes;
+  mbedtls_aes_init(&aes);
+
+  
+  size_t inputLen = plainText.length();
+  size_t paddedLen = ((inputLen + 15) / 16) * 16;
+  uint8_t input[paddedLen];
+  uint8_t padValue = paddedLen - inputLen;
+memcpy(input, plainText.c_str(), inputLen);
+for (size_t i = inputLen; i < paddedLen; ++i) {
+  input[i] = padValue;
+}
+  memcpy(input, plainText.c_str(), inputLen);
+
+  uint8_t output[paddedLen];
+  mbedtls_aes_setkey_enc(&aes, aesKey, 128);
+
+  for (size_t i = 0; i < paddedLen; i += 16) {
+    mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_ENCRYPT, input + i, output + i);
+  }
+
+  mbedtls_aes_free(&aes);
+
+  String encoded = base64::encode(output, paddedLen);
+  return encoded;
+}
+
+void sendEncryptedData(const String& encryptedData) {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    http.begin(serverUrl);
+    http.addHeader("Content-Type", "text/plain");
+
+    int httpResponseCode = http.POST(encryptedData);
+
+    Serial.print("HTTP answer: ");
+    Serial.println(httpResponseCode);
+    Serial.println(http.getString());
+
+    http.end();
+  } else {
+    Serial.println("There is no wifi connection.");
+  }
+}
 
 void setup() {
   Serial.begin(115200);
+  delay(1000);
 
-  // LCD and DHT
-  lcd.init();
-  lcd.backlight();
-  dht.begin();
+  connectToWiFi();
 
-  pinMode(TRIG_PIN, OUTPUT);
-  pinMode(ECHO_PIN, INPUT);
-  pinMode(BUZZER_PIN, OUTPUT);
-
-  // Motor pins
-  pinMode(MOTOR1_IN1, OUTPUT);
-  pinMode(MOTOR1_IN2, OUTPUT);
-  pinMode(MOTOR2_IN1, OUTPUT);
-  pinMode(MOTOR2_IN2, OUTPUT);
+  Serial.begin(115200);
+  Serial.println(WiFi.macAddress());
+  
 }
 
 void loop() {
-  // Sensor calculations
-  float temperature = dht.readTemperature();
-  float humidity = dht.readHumidity();
+  String sensorData = generateSensorData();
+  Serial.println("Original data: " + sensorData);
 
-  if (isnan(temperature) || isnan(humidity)) {
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("Sensor error!");
-    return;
-  }
+  String encrypted = encryptAES128(sensorData);
+  Serial.println("Crypted data: " + encrypted);
 
-  // Distance implementation
-  digitalWrite(TRIG_PIN, LOW);
-  delayMicroseconds(2);
-  digitalWrite(TRIG_PIN, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(TRIG_PIN, LOW);
+  sendEncryptedData(encrypted);
 
-  long duration = pulseIn(ECHO_PIN, HIGH, 30000); // timeout 30ms
-  float distance = duration * 0.034 / 2;
-
-  // distance control
-  if (distance < 2 || distance > 300) {
-    distance = 999;
-  }
-
-  bool alert = (distance < 10.0 && distance != 999) || (temperature > 35.0);
-  digitalWrite(BUZZER_PIN, alert ? LOW : HIGH); // buzzer trigger boolean
-
-  if (millis() - lastDisplayUpdate >= 1000) {
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("TEMP(C): ");
-    lcd.print(temperature, 1);
-
-    lcd.setCursor(0, 1);
-    lcd.print("HUM: ");
-    lcd.print(humidity, 1);
-    lcd.print("%");
-    lcd.print(" D:");
-    lcd.print(distance == 999 ? 0 : distance, 0); // invalid distance
-    
-    lastDisplayUpdate = millis();
-  }
-
-  static unsigned long lastMotorTime = 0;
-  static int phase = 0;
-
-  if (millis() - lastMotorTime >= 1000) {
-    lastMotorTime = millis();
-
-    // Motorları durdurma kontrolü
-    if (distance < 10.0 && distance != 999) {
-      // Motorları durdur
-      digitalWrite(MOTOR1_IN1, LOW);
-      digitalWrite(MOTOR1_IN2, LOW);
-      digitalWrite(MOTOR2_IN1, LOW);
-      digitalWrite(MOTOR2_IN2, LOW);
-      Serial.println("Engel var! Motorlar durdu.");
-      return; // Aşağıdaki motor fazlarını atla
-    }
-
-    switch (phase) {
-      case 0: // forward
-        digitalWrite(MOTOR1_IN1, HIGH);
-        digitalWrite(MOTOR1_IN2, LOW);
-        digitalWrite(MOTOR2_IN1, HIGH);
-        digitalWrite(MOTOR2_IN2, LOW);
-        Serial.println("İleri gidiyor");
-        break;
-
-      case 1: // stop
-        digitalWrite(MOTOR1_IN1, LOW);
-        digitalWrite(MOTOR1_IN2, LOW);
-        digitalWrite(MOTOR2_IN1, LOW);
-        digitalWrite(MOTOR2_IN2, LOW);
-        Serial.println("Durdu");
-        break;
-
-      case 2: // back
-        digitalWrite(MOTOR1_IN1, LOW);
-        digitalWrite(MOTOR1_IN2, HIGH);
-        digitalWrite(MOTOR2_IN1, LOW);
-        digitalWrite(MOTOR2_IN2, HIGH);
-        Serial.println("Geri gidiyor");
-        break;
-
-      case 3: // stop
-        digitalWrite(MOTOR1_IN1, LOW);
-        digitalWrite(MOTOR1_IN2, LOW);
-        digitalWrite(MOTOR2_IN1, LOW);
-        digitalWrite(MOTOR2_IN2, LOW);
-        Serial.println("Durdu");
-        break;
-    }
-
-    phase = (phase + 1) % 4;
-  }
+  delay(20000);
 }
-
